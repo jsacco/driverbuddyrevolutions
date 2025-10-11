@@ -25,7 +25,7 @@ Uses presence/absence of known API calls and string/constant analysis to flag su
 
 
 # Credits:
-Based on: https://github.com/nccgroup/DriverBuddy
+IOCTL Decoded: https://github.com/tandasat/WinIoCtlDecoder/blob/master/plugins/WinIoCtlDecoder.py
 
 Original DriverBuddy (IDA): https://github.com/nccgroup/DriverBuddy
 
