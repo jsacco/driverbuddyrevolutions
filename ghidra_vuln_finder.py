@@ -1,3 +1,4 @@
+# Ghidra 'Driver Buddy Revolutions' 
 # Filename: ghidra_vuln_finder.py
 #@category Analysis/Vulnerability
 #@keybinding Shift A
@@ -9,6 +10,7 @@ from ghidra.util.task import TaskMonitor
 from java.io import FileWriter, BufferedWriter, File
 from ghidra.app.decompiler import DecompInterface, DecompileOptions
 from ghidra.program.model.pcode import PcodeOp
+from ghidra.util.task import ConsoleTaskMonitor
 
 import re
 import time
@@ -123,10 +125,6 @@ def find_compare_addresses_for_constant(func, const_val):
         pass
     return None
 
-def is_dispatch_ioctl_handler(dt):
-    # True when the decompiled function references the IRP stack and IoControlCode
-    return ('Parameters.DeviceIoControl' in dt) or ('IoControlCode' in dt) or ('IRP_MJ_DEVICE_CONTROL' in dt)
-
 def is_call_to(instr, names):
     try:
         if not instr.getFlowType().isCall():
@@ -141,33 +139,7 @@ def is_call_to(instr, names):
         pass
     return False
 
-def backward_find_ioctl_immediate(start_instr, max_back=BACKWARD_SCAN_DEFAULT):
-    """
-    Walk backward from start_instr up to max_back instructions, return first plausible CTL_CODE immediate value.
-    """
-    listing = currentProgram.getListing()
-    body = getFunctionContaining(start_instr.getAddress()).getBody()
-    insns = [i for i in listing.getInstructions(body, True)]
-    try:
-        idx = insns.index(start_instr)
-    except ValueError:
-        return None
-    for j in range(idx-1, max(idx-1-max_back, -1), -1):
-        ins = insns[j]
-        try:
-            for opi in range(ins.getNumOperands()):
-                sc = ins.getScalar(opi)
-                if sc is None:
-                    continue
-                val = sc.getValue() & 0xFFFFFFFF
-                if plausible_ioctl(val):
-                    return val
-        except Exception:
-            pass
-    return None
-
 # ---------- Heuristics for user-driven input / validation ----------
-
 def is_ioctl_context_text(dt):
     return ('IRP_MJ_DEVICE_CONTROL' in dt) or ('IoControlCode' in dt) or ('Parameters.DeviceIoControl' in dt)
 
@@ -228,9 +200,6 @@ def last_arg_is_const_one_heuristic(func, call_name):
     return None
 
 def immediate_nearby_value(func, call_name, max_back=8):
-    """
-    Return first immediate found near a call to call_name (for size/flags heuristics).
-    """
     listing = currentProgram.getListing()
     for instr in listing.getInstructions(func.getBody(), True):
         if is_call_to(instr, [call_name]):
@@ -368,49 +337,125 @@ else:
 driver_type = "Mini-Filter" if any(n.startswith('Flt') for n,_,_ in api_hits) else "Unknown"
 lines.append("[+] Driver type detected: {}".format(driver_type))
 
+# =============================================================================
+# =============== NEW IOCTL DISCOVERY (dispatch/regex approach) ===============
+# =============================================================================
+
+def _extract_function_name_from_line(line):
+    # FUN_XXXXXXXX first
+    m = re.search(r'(FUN_[0-9a-fA-F]+)', line)
+    if m:
+        return m.group(1)
+    # or an assignment to a named function
+    m = re.search(r'=\s*&?([a-zA-Z_][a-zA-Z0-9_]*)\s*;', line)
+    if m:
+        return m.group(1)
+    return None
+
+def _resolve_fun_name_to_function(fun_name):
+    """
+    Accepts either 'FUN_XXXXXXXX' or a symbol name; returns a Ghidra Function or None.
+    """
+    fm = currentProgram.getFunctionManager()
+    if fun_name.startswith("FUN_"):
+        try:
+            addr = currentProgram.getAddressFactory().getAddress(fun_name[4:])
+            return fm.getFunctionAt(addr)
+        except Exception:
+            return None
+    # try by name
+    try:
+        for f in fm.getFunctions(True):
+            if f.getName() == fun_name:
+                return f
+    except Exception:
+        pass
+    return None
+
+def _find_dispatch_routines():
+    """
+    Find IRP_MJ_DEVICE_CONTROL dispatch routines by scanning decompiled C for:
+      - (param_X + 0xe0) = ...
+      - MajorFunction[0xe] / MajorFunction[14]
+    Returns a list of Ghidra Function objects (deduped).
+    """
+    fm = currentProgram.getFunctionManager()
+    routines = []
+    seen = set()
+
+    patterns = [
+        r'\(param_[1-9] \+ 0xe0\)\s*=',
+        r'MajorFunction\[0xe\]',
+        r'MajorFunction\[14\]'
+    ]
+
+    for f in fm.getFunctions(True):
+        dt = decompiled_text(f)
+        if not dt:
+            continue
+        for line in dt.splitlines():
+            for pat in patterns:
+                if re.search(pat, line):
+                    name = _extract_function_name_from_line(line)
+                    if not name:
+                        continue
+                    tgt = _resolve_fun_name_to_function(name)
+                    if tgt and tgt.getEntryPoint().toString() not in seen:
+                        seen.add(tgt.getEntryPoint().toString())
+                        routines.append(tgt)
+    return routines
+
+def _find_ioctls_in_decompiled_text(c_code):
+    """
+    Find IOCTL hex constants in decompiled C text (>= 0x200000 typical 3rd-party range).
+    """
+    ioctls = set()
+    if not c_code:
+        return []
+    normalized = re.sub(r'\s+', ' ', c_code)
+
+    patterns = [
+        r'case\s+0x([0-9A-Fa-f]+)\s*:',
+        r'ioControlCode\s*==\s*0x([0-9A-Fa-f]+)',
+        r'(?:if|else if)\s*\(\s*(?:\([^)]*\))?\s*(?:iVar\d+|uVar\d+|\w+)\s*==\s*0x([0-9A-Fa-f]+)',
+        r'(?:\(\s*)+(?:iVar\d+|uVar\d+|\w+)\s*==\s*0x([0-9A-Fa-f]+)(?:\s*\))+',
+        r'(?:iVar\d+|uVar\d+|\w+)\s*==\s*0x([0-9A-Fa-f]+)',
+        r'\(\s*(?:\([^)]*\)\s*&&\s*)*[^)]*==\s*0x([0-9A-Fa-f]+)',
+        r'else\s*{[^}]*==\s*0x([0-9A-Fa-f]+)[^}]*}',
+        r'IOCTL_[A-Z_]+\s*=\s*0x([0-9A-Fa-f]+)',
+        r'#define\s+IOCTL_[A-Z_]+\s+0x([0-9A-Fa-f]+)'
+    ]
+
+    for pat in patterns:
+        try:
+            for m in re.finditer(pat, normalized, re.IGNORECASE | re.MULTILINE | re.DOTALL):
+                val = int(m.group(1), 16)
+                if val >= 0x200000 and plausible_ioctl(val):
+                    ioctls.add(val & 0xFFFFFFFF)
+        except Exception:
+            pass
+    return sorted(ioctls)
+
 # ----------------------------- IOCTL discovery -----------------------------
 lines.append("[>] Searching for IOCTLs found by analysis...")
 rows = []
 seen = set()
 
-# A) Decomp scan for dispatch-style handlers
-for func in listing.getFunctions(True):
-    dt = decompiled_text(func)
-    if not is_dispatch_ioctl_handler(dt):
-        continue
-    for line in dt.splitlines():
-        if 'IoControlCode' not in line and 'DeviceIoControl' not in line:
-            continue
-        for m in re.finditer(r'0x[0-9A-Fa-f]+', line):
-            try:
-                val = int(m.group(0), 16) & 0xFFFFFFFF
-            except Exception:
-                continue
-            if not plausible_ioctl(val):
-                continue
-            addr = find_compare_addresses_for_constant(func, val) or "0x0"
-            key = (addr, val)
-            if key in seen: continue
-            row = fmt_ioctl_row(addr, val)
-            if row:
-                rows.append(row); seen.add(key)
+dispatch_funcs = _find_dispatch_routines()
 
-# B) Caller-side detection: IoBuildDeviceIoControlRequest
-ioctl_call_names = ["IoBuildDeviceIoControlRequest"]
-for func in listing.getFunctions(True):
+for df in dispatch_funcs:
     try:
-        for instr in listing.getInstructions(func.getBody(), True):
-            if not is_call_to(instr, ioctl_call_names):
+        c_text = decompiled_text(df)
+        codes = _find_ioctls_in_decompiled_text(c_text)
+        for code in codes:
+            addr = find_compare_addresses_for_constant(df, code) or df.getEntryPoint().toString()
+            key = (addr, code)
+            if key in seen:
                 continue
-            v = backward_find_ioctl_immediate(instr, max_back=BACKWARD_SCAN_DEFAULT)
-            if v is None or not plausible_ioctl(v):
-                continue
-            addr = instr.getAddress().toString()
-            key = (addr, v)
-            if key in seen: continue
-            row = fmt_ioctl_row(addr, v)
+            row = fmt_ioctl_row(addr, code)
             if row:
-                rows.append(row); seen.add(key)
+                rows.append(row)
+                seen.add(key)
     except Exception:
         pass
 
@@ -479,7 +524,6 @@ for func in currentProgram.getListing().getFunctions(True):
             addr = get_instr_addr_str_from_text_hit(func, idx)
             risky = looks_user_driven_expr(dt) and not nearby_has_validation(dt, idx)
             sev = "High" if (in_ioctl_ctx and risky) else ("Medium" if in_ioctl_ctx else "Low")
-            # Try to extract some immediate (often Size or CacheType flags)
             imm = immediate_nearby_value(func, api_name, max_back=8)
             size_hint = ""
             if imm is not None and imm >= HEURISTIC_LARGE_MAP_SIZE:
@@ -510,7 +554,7 @@ for func in currentProgram.getListing().getFunctions(True):
         for prefix in ('READ_PORT_', 'WRITE_PORT_', 'READ_REGISTER_', 'WRITE_REGISTER_'):
             for name, idx in find_calls_in_text(dt, prefix):
                 addr = get_instr_addr_str_from_text_hit(func, idx)
-                sev = "High" if name.startswith('WRITE_') else "High"
+                sev = "High"  # writes and reads are both sensitive without gating
                 report_issue("Port/Register IO from IOCTL", func, addr,
                              "{} used; ensure whitelist, bounds and privilege checks".format(name), severity=sev)
 
@@ -531,21 +575,27 @@ for func in currentProgram.getListing().getFunctions(True):
     for name in string_copy_names:
         for _, idx in find_calls_in_text(dt, name):
             addr = get_instr_addr_str_from_text_hit(func, idx)
-            # If user-driven data present and no validation near the call, warn.
             if looks_user_driven_expr(dt) and not nearby_has_validation(dt, idx):
-                report_issue("User copy w/o validation", func, addr,
-                             "{} appears near user-controlled buffer/size and lacks nearby validation".format(name),
-                             severity="High" if in_ioctl_ctx else "Medium")
+                lines.append("[!] {}: {} in {} at {} :: {}".format(
+                    "High" if in_ioctl_ctx else "Medium",
+                    "User copy w/o validation",
+                    func.getName(),
+                    addr,
+                    "{} appears near user-controlled buffer/size and lacks nearby validation".format(name)
+                ))
 
     # Allocations driven by user length without safe arithmetic helpers
     for an in allocation_names:
         for _, idx in find_calls_in_text(dt, an):
             addr = get_instr_addr_str_from_text_hit(func, idx)
-            # If the function text references InputBufferLength and does not use Rtl*Add/Mult helpers nearby, warn.
             if looks_user_driven_expr(dt) and not nearby_has_validation(dt, idx):
-                report_issue("Potential integer overflow in allocation", func, addr,
-                             "{} may be sized from user input without safe arithmetic (Rtl*Add/Mult)".format(an),
-                             severity="High" if in_ioctl_ctx else "Medium")
+                lines.append("[!] {}: {} in {} at {} :: {}".format(
+                    "High" if in_ioctl_ctx else "Medium",
+                    "Potential integer overflow in allocation",
+                    func.getName(),
+                    addr,
+                    "{} may be sized from user input without safe arithmetic (Rtl*Add/Mult)".format(an)
+                ))
 
     # Privilege gating: sensitive operations in IOCTL path without privilege checks
     if in_ioctl_ctx:
@@ -562,7 +612,7 @@ lines.append("[>] Saved decoded IOCTLs log file to \"{}\"".format(ioctl_log_path
 lines.append("[+] Analysis Completed!")
 lines.append("-----------------------------------------------")
 
-auto_path = File.createTempFile(currentProgram.getName() + "-DriverBuddyReloaded_autoanalysis-", ".txt").getAbsolutePath()
+auto_path = File.createTempFile(currentProgram.getName() + "-DriverBuddyRevolutions_autoanalysis-", ".txt").getAbsolutePath()
 try:
     bw = BufferedWriter(FileWriter(auto_path))
     bw.write("\r\n".join(lines))
