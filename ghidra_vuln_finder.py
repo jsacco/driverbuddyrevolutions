@@ -107,6 +107,12 @@ def fmt_ioctl_row(addr_str, code_val):
         addr_str, dec['raw'], device, "0x%X" % dec['device'], dec['function'], method, dec['method'], access, dec['access']
     )
 
+# --- IOCTL table header (ASCII-only) ---
+IOCTL_TABLE_HEADER = (
+    "Address               | IOCTL Code | Device                           DeviceId | Function | Method              MethodId | Access"
+)
+IOCTL_TABLE_UNDERLINE = "-" * len(IOCTL_TABLE_HEADER)
+
 def find_compare_addresses_for_constant(func, const_val):
     """
     Scan instructions in func to find first instruction that uses const_val as a scalar; return address string.
@@ -519,17 +525,24 @@ for df in dispatch_funcs:
     except Exception:
         pass
 
+# ----- Header-only change: show a table header before rows -----
 if rows:
+    lines.append("")
+    lines.append("[>] Decoded IOCTLs:")
+    lines.append(IOCTL_TABLE_HEADER)
+    lines.append(IOCTL_TABLE_UNDERLINE)
     for r in sorted(set(rows)):
         lines.append(r)
 else:
     lines.append("  - (none detected)")
 
-# Save decoded IOCTLs log
+# Save decoded IOCTLs log (include the same header)
 ioctl_log_path = File.createTempFile(currentProgram.getName() + "-IOCTLs-", ".txt").getAbsolutePath()
 try:
     bw = BufferedWriter(FileWriter(ioctl_log_path))
     if rows:
+        bw.write(IOCTL_TABLE_HEADER + "\r\n")
+        bw.write(IOCTL_TABLE_UNDERLINE + "\r\n")
         for r in sorted(set(rows)):
             bw.write(r + "\r\n")
     else:
@@ -539,7 +552,7 @@ except Exception:
     pass
 
 # --------------------- Physical memory / IO space checks --------------------
-lines.append("[>] Scanning for physical memory / IO space patterns...")
+lines.append("\n[>] Scanning for physical memory / IO space patterns...")
 
 def report_issue(kind, func, addr_str, detail, severity='High'):
     lines.append("[!] {}: {} in {} at {} :: {}".format(severity, kind, func.getName(), addr_str, detail))
@@ -619,8 +632,237 @@ for func in currentProgram.getListing().getFunctions(True):
                              "{} used; ensure whitelist, bounds and privilege checks".format(name), severity=sev)
 
 # --------------------- General vuln heuristics (memory, overflow, ACL) -----
+# --------------------- General vuln heuristics (memory, overflow, ACL) -----
 lines.append("[>] Scanning for general driver vuln patterns...")
 
+allocation_names = ['ExAllocatePool', 'ExAllocatePoolWithTag', 'ExAllocatePool2']
+string_copy_names = ['memcpy', 'memmove', 'RtlCopyMemory']
+priv_guard_apis = ['SeSinglePrivilegeCheck', 'SeAccessCheck', 'ZwQueryInformationToken', 'IoIsSystemThread']
+
+for func in currentProgram.getListing().getFunctions(True):
+    dt = decompiled_text(func)
+    if not dt:
+        continue
+    in_ioctl_ctx = is_ioctl_context_text(dt)
+
+    # (ORIGINAL) User-copy without obvious probe/length checks
+    for name in string_copy_names:
+        for _, idx in find_calls_in_text(dt, name):
+            addr = get_instr_addr_str_from_text_hit(func, idx)
+            if looks_user_driven_expr(dt) and not nearby_has_validation(dt, idx):
+                lines.append("[!] {}: {} in {} at {} :: {}".format(
+                    "High" if in_ioctl_ctx else "Medium",
+                    "User copy w/o validation",
+                    func.getName(),
+                    addr,
+                    "{} appears near user-controlled buffer/size and lacks nearby validation".format(name)
+                ))
+
+    # (ORIGINAL) Allocations driven by user length without safe arithmetic helpers
+    for an in allocation_names:
+        for _, idx in find_calls_in_text(dt, an):
+            addr = get_instr_addr_str_from_text_hit(func, idx)
+            if looks_user_driven_expr(dt) and not nearby_has_validation(dt, idx):
+                lines.append("[!] {}: {} in {} at {} :: {}".format(
+                    "High" if in_ioctl_ctx else "Medium",
+                    "Potential integer overflow in allocation",
+                    func.getName(),
+                    addr,
+                    "{} may be sized from user input without safe arithmetic (Rtl*Add/Mult)".format(an)
+                ))
+
+    # (ORIGINAL) Privilege gating: sensitive operations in IOCTL path without privilege checks
+    if in_ioctl_ctx:
+        sensitive = any(k in dt for k in ['MmMapIoSpace', 'MmCopyMemory', 'ZwOpenSection', 'ZwMapViewOfSection',
+                                          'READ_PORT_', 'WRITE_PORT_', 'READ_REGISTER_', 'WRITE_REGISTER_'])
+        if sensitive:
+            has_guard = any(api in dt for api in priv_guard_apis)
+            if not has_guard:
+                lines.append("[!] High: Missing privilege gate in {} :: Sensitive ops in IOCTL path without guards".format(func.getName()))
+
+# ===================== NEW: POPKORN-style deep checks (High/Critical only) =====================
+# Conservative p-code/SSA taint from IOCTL user sources to dangerous sinks, with rationale.
+
+# Local (section-scoped) config to avoid altering globals
+_DEEP_STRING_COPIES = ['memcpy','memmove','RtlCopyMemory','RtlMoveMemory']
+_DEEP_DANG_STR = ['strcpy','wcscpy','strcat','sprintf','swprintf']
+_DEEP_ALLOC = ['ExAllocatePool','ExAllocatePoolWithTag','ExAllocatePool2']
+_DEEP_PHYS = ['ZwOpenSection','ZwMapViewOfSection','MmCopyMemory','MmMapIoSpace','MmMapIoSpaceEx','MmGetPhysicalAddress']
+_DEEP_PORT_PREFIXES = ('READ_PORT_','WRITE_PORT_','READ_REGISTER_','WRITE_REGISTER_')
+_DEEP_VALIDATION = ['ProbeForRead','ProbeForWrite','MmIsAddressValid']
+_DEEP_SAFE_ARITH = ['RtlULongAdd','RtlULongLongAdd','RtlULongSub','RtlULongLongSub','RtlULongMult','RtlULongLongMult','RtlSizeTAdd','RtlSizeTMult']
+_DEEP_USER_SEEDS = [
+    'Parameters.DeviceIoControl.InputBufferLength',
+    'Parameters.DeviceIoControl.OutputBufferLength',
+    'Parameters.DeviceIoControl.Type3InputBuffer',
+    'Irp->AssociatedIrp.SystemBuffer',
+    'Irp->UserBuffer',
+    'MdlAddress'
+]
+
+def _deep_is_port_or_reg(name):
+    for p in _DEEP_PORT_PREFIXES:
+        if name and name.startswith(p):
+            return True
+    return False
+
+def _deep_hf(func):
+    try:
+        r = decompile_func(func)
+        if r and r.getHighFunction():
+            return r.getHighFunction()
+    except Exception:
+        pass
+    return None
+
+def _deep_seed_user_taint(hf):
+    seeds = []
+    it = hf.getPcodeOps()
+    while it.hasNext():
+        op = it.next()
+        for v in op.getInputs():
+            try:
+                h = v.getHigh()
+                nm = h.getName() if h else ''
+                if nm and any(k in nm for k in _DEEP_USER_SEEDS):
+                    seeds.append(v)
+            except Exception:
+                pass
+    return seeds
+
+def _deep_taint_walk(hf, seeds):
+    tainted = set(seeds)
+    changed = True
+    while changed:
+        changed = False
+        it = hf.getPcodeOps()
+        while it.hasNext():
+            op = it.next()
+            opc = op.getOpcode()
+            # Forward-propagate through common ops
+            if opc in (PcodeOp.COPY, PcodeOp.INT_ADD, PcodeOp.INT_SUB, PcodeOp.INT_MULT,
+                       PcodeOp.PTRADD, PcodeOp.PTRSUB, PcodeOp.CAST, PcodeOp.SEXT, PcodeOp.ZEXT):
+                if any(inp in tainted for inp in op.getInputs()):
+                    outv = op.getOutput()
+                    if outv and outv not in tainted:
+                        tainted.add(outv); changed = True
+            elif opc == PcodeOp.CALL:
+                # Conservative: any tainted input -> taint output (if present)
+                if any(inp in tainted for inp in op.getInputs()):
+                    outv = op.getOutput()
+                    if outv and outv not in tainted:
+                        tainted.add(outv); changed = True
+    return tainted
+
+def _deep_call_name_from_op(op):
+    try:
+        callee_vn = op.getInputs()[0]
+        h = callee_vn.getHigh()
+        if h and h.getSymbol():
+            return h.getSymbol().getName()
+    except Exception:
+        pass
+    return None
+
+def _deep_has_validation_near(dt, idx):
+    # Reuse existing utility but with added safe-arith list
+    if nearby_has_validation(dt, idx):
+        return True
+    window = 300
+    s = max(0, idx - window); e = min(len(dt), idx + window)
+    chunk = dt[s:e]
+    return any(api in chunk for api in _DEEP_SAFE_ARITH)
+
+# Walk all functions again for deep taint to sinks
+for func in currentProgram.getListing().getFunctions(True):
+    dt = decompiled_text(func)
+    if not dt:
+        continue
+    in_ioctl_ctx = is_ioctl_context_text(dt)
+
+    hf = _deep_hf(func)
+    if not hf:
+        continue
+
+    # Heuristic: immediately flag METHOD_NEITHER / UserBuffer usage without probes in IOCTL path
+    if in_ioctl_ctx and (('Parameters.DeviceIoControl.Type3InputBuffer' in dt) or ('Irp->UserBuffer' in dt)):
+        has_probe = any(v in dt for v in _DEEP_VALIDATION) or ('__try' in dt or 'try {' in dt)
+        if not has_probe:
+            sev = "Critical" if 'Type3InputBuffer' in dt else "High"
+            lines.append("[!] {}: Direct user pointer access in {} at {} :: {}"
+                         .format(sev, func.getName(), func.getEntryPoint().toString(),
+                                 "Type3InputBuffer/Irp->UserBuffer used without ProbeForRead/Write or SEH guard"))
+            lines.append("    Rationale: METHOD_NEITHER/user pointer lets kernel touch arbitrary user VA; missing probes/guards makes this exploitable.")
+
+    seeds = _deep_seed_user_taint(hf)
+    if not seeds:
+        continue
+
+    tainted = _deep_taint_walk(hf, seeds)
+
+    # Scan p-code calls (sinks)
+    it = hf.getPcodeOps()
+    while it.hasNext():
+        op = it.next()
+        if op.getOpcode() != PcodeOp.CALL:
+            continue
+
+        callee = _deep_call_name_from_op(op)
+        args = list(op.getInputs())[1:]  # skip target (slot 0)
+        tainted_idxs = [i for i, a in enumerate(args) if a in tainted]
+        call_addr = op.getSeqnum().getTarget().toString()
+
+        # memcpy/memmove family with tainted pointer/length
+        if callee in _DEEP_STRING_COPIES and tainted_idxs and in_ioctl_ctx:
+            idx_in_text = dt.find(callee) if callee else -1
+            if idx_in_text == -1 or not _deep_has_validation_near(dt, idx_in_text):
+                lines.append("[!] High: User copy without validation in {} at {} :: {}".format(
+                    func.getName(), call_addr, callee))
+                lines.append("    Rationale: tainted src/len reaches {} from IOCTL path without nearby Probe/length checks; overflow/info leak risk."
+                             .format(callee))
+
+        # strcpy/strcat/sprintf family with tainted data
+        if callee in _DEEP_DANG_STR and tainted_idxs and in_ioctl_ctx:
+            lines.append("[!] High: Dangerous string op with user data in {} at {} :: {}".format(
+                func.getName(), call_addr, callee))
+            lines.append("    Rationale: {} with user-controlled input in kernel context can overflow fixed buffers.".format(callee))
+
+        # Pool allocation sized by tainted value without safe arithmetic
+        if callee in _DEEP_ALLOC and tainted_idxs and in_ioctl_ctx:
+            idx_in_text = dt.find(callee)
+            has_safe_arith = any(api in dt for api in _DEEP_SAFE_ARITH)
+            if not has_safe_arith:
+                lines.append("[!] High: Potential integer overflow in allocation in {} at {} :: {}".format(
+                    func.getName(), call_addr, callee))
+                lines.append("    Rationale: allocation size derived from user length without Rtl*Add/Mult/SizeT guards -> wrap then overflow on copy.")
+
+        # Physical memory / IO mapping / physical copy with tainted args
+        if callee in _DEEP_PHYS and tainted_idxs and in_ioctl_ctx:
+            sev = "Critical" if callee in ('MmCopyMemory','MmMapIoSpace','MmMapIoSpaceEx') else "High"
+            lines.append("[!] {}: Physical/IO access with user data in {} at {} :: {}".format(
+                sev, func.getName(), call_addr, callee))
+            lines.append("    Rationale: user-controlled PA/size drives {}; enables arbitrary physical/MMIO access.".format(callee))
+
+        # MDL -> UserMode mapping with tainted args
+        if callee == 'MmMapLockedPagesSpecifyCache' and tainted_idxs and in_ioctl_ctx and ('UserMode' in dt):
+            lines.append("[!] High: MDL mapped to UserMode (user-influenced) in {} at {} :: MmMapLockedPagesSpecifyCache".format(
+                func.getName(), call_addr))
+            lines.append("    Rationale: user-controlled pages mapped to user mode from IOCTL path; kernel memory leak/write primitive.")
+
+        # Port/Register I/O with tainted args
+        if _deep_is_port_or_reg(callee) and tainted_idxs and in_ioctl_ctx:
+            lines.append("[!] High: Port/Register I/O with user data in {} at {} :: {}".format(
+                func.getName(), call_addr, callee))
+            lines.append("    Rationale: tainted values reach hardware access routine from IOCTL path; device state corruption possible.")
+
+    # Missing privilege gates around sensitive operations (rationale version; keep original too)
+    sensitive_txt = any(k in dt for k in ['MmMapIoSpace','MmCopyMemory','ZwOpenSection','ZwMapViewOfSection']) or \
+                    any(p in dt for p in _DEEP_PORT_PREFIXES)
+    if in_ioctl_ctx and sensitive_txt and not any(api in dt for api in priv_guard_apis):
+        lines.append("[!] High: Missing privilege gate in {} at {} :: Sensitive ops reachable from IOCTL".format(
+            func.getName(), func.getEntryPoint().toString()))
+        lines.append("    Rationale: no Se*/AccessCheck/Token validation near sensitive memory/IO operations; unprivileged callers may reach dangerous code paths.")
+# =================== END NEW: POPKORN-style deep checks (High/Critical) ===================
 allocation_names = ['ExAllocatePool', 'ExAllocatePoolWithTag', 'ExAllocatePool2']
 string_copy_names = ['memcpy', 'memmove', 'RtlCopyMemory']
 priv_guard_apis = ['SeSinglePrivilegeCheck', 'SeAccessCheck', 'ZwQueryInformationToken', 'IoIsSystemThread']
