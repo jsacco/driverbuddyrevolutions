@@ -400,7 +400,15 @@ else:
     lines.append("  - (none detected)")
 
 # ----------------------------- Driver type heuristic -----------------------
-driver_type = "Mini-Filter" if any(n.startswith('Flt') for n,_,_ in api_hits) else "Unknown"
+api_names = [n for n, _, _ in api_hits]
+driver_type = "Unknown"
+if any(n.startswith("Flt") for n in api_names):
+    driver_type = "Mini-Filter"
+elif any(n.startswith("Wdf") for n in api_names):
+    driver_type = "KMDF"
+elif any(n.startswith("IoCreateDevice") or n.startswith("IoCreateDriver") or n.startswith("IoCreateSymbolicLink")
+         for n in api_names):
+    driver_type = "WDM"
 lines.append("[+] Driver type detected: {}".format(driver_type))
 
 # =============================================================================
