@@ -525,6 +525,27 @@ for df in dispatch_funcs:
     except Exception:
         pass
 
+# ----------------------------- Fallback: scan all funcs --------------------
+# Many drivers inline or obfuscate dispatch registration; as a fallback,
+# scan every decompiled function for IOCTL-like constants and record them.
+for f in currentProgram.getListing().getFunctions(True):
+    try:
+        c_text = decompiled_text(f)
+        codes = _find_ioctls_in_decompiled_text(c_text)
+        if not codes:
+            continue
+        for code in codes:
+            addr = find_compare_addresses_for_constant(f, code) or f.getEntryPoint().toString()
+            key = (addr, code)
+            if key in seen:
+                continue
+            row = fmt_ioctl_row(addr, code)
+            if row:
+                rows.append(row)
+                seen.add(key)
+    except Exception:
+        pass
+
 # ----- Header-only change: show a table header before rows -----
 if rows:
     lines.append("")
