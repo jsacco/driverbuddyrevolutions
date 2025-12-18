@@ -500,6 +500,63 @@ def _find_dispatch_routines_fallback_by_switch():
         routines.append(f)
     return routines
 
+# --- IDA-style heuristics ---
+def _find_dispatch_by_struct_index():
+    """
+    IDA-style heuristic: look for MOV into [reg+0x70] (MajorFunction[0xE]) with a function pointer.
+    """
+    listing = currentProgram.getListing()
+    fm = currentProgram.getFunctionManager()
+    candidates = set()
+    for f in fm.getFunctions(True):
+        try:
+            for instr in listing.getInstructions(f.getBody(), True):
+                if instr.getMnemonicString().upper() != "MOV":
+                    continue
+                if "+0x70" not in instr.toString().lower():
+                    continue
+                for ref in instr.getReferencesFrom():
+                    tgt = getFunctionAt(ref.getToAddress())
+                    if tgt:
+                        candidates.add(tgt)
+        except Exception:
+            pass
+    return list(candidates)
+
+def _find_dispatch_by_cfg():
+    """
+    IDA-style heuristic: functions with no incoming code refs but with outgoing calls (>0).
+    """
+    fm = currentProgram.getFunctionManager()
+    candidates = []
+    incoming = set()
+    outcount = {}
+    for f in fm.getFunctions(True):
+        if f.isExternal():
+            continue
+        entry = f.getEntryPoint()
+        try:
+            for ref in getReferencesTo(entry):
+                rt = ref.getReferenceType()
+                if rt is not None and rt.isFlow():
+                    incoming.add(f.getName())
+                    break
+        except Exception:
+            pass
+        cnt = 0
+        try:
+            for instr in currentProgram.getListing().getInstructions(f.getBody(), True):
+                if instr.getFlowType().isCall():
+                    cnt += 1
+        except Exception:
+            pass
+        outcount[f] = cnt
+    for f, cnt in outcount.items():
+        if cnt > 0 and f.getName() not in incoming:
+            candidates.append((cnt, f))
+    candidates = sorted(candidates, key=lambda x: x[0], reverse=True)
+    return [f for _, f in candidates]
+
 def _find_ioctls_in_decompiled_text(c_code):
     """
     Find IOCTL hex constants in decompiled C text (>= 0x200000 typical 3rd-party range).
@@ -537,12 +594,57 @@ rows = []
 seen = set()
 # Track IOCTL counts per function to guess a dispatcher if table heuristics miss
 ioctl_count_by_func = {}
+dispatcher_score = {}
+
+def _bump_score(func, pts):
+    if func is None:
+        return
+    dispatcher_score[func] = dispatcher_score.get(func, 0) + pts
 
 dispatch_funcs = _find_dispatch_routines()
+# Give a base score to table-based detections
+for f in dispatch_funcs:
+    _bump_score(f, 1)
 # Add switch-based heuristics if dispatch table detection missed them
 for f in _find_dispatch_routines_fallback_by_switch():
     if all(f.getEntryPoint().toString() != d.getEntryPoint().toString() for d in dispatch_funcs):
         dispatch_funcs.append(f)
+    _bump_score(f, 1)
+# IDA-style heuristics: prefer struct-offset hits; otherwise fallback to CFG (filtered)
+struct_hits = _find_dispatch_by_struct_index()
+cfg_hits = _find_dispatch_by_cfg()
+blacklist_names = {"__security_check_cookie", "start", "DriverEntry", "Real_Driver_Entry",
+                   "__GSHandlerCheck_SEH", "__GSHandlerCheck", "entry"}
+
+# If we found struct hits, use them (plus any prior ones)
+if struct_hits:
+    for f in struct_hits:
+        if all(f.getEntryPoint().toString() != d.getEntryPoint().toString() for d in dispatch_funcs):
+            dispatch_funcs.append(f)
+        _bump_score(f, 2)
+elif cfg_hits:
+    # Take top 3 cfg hits, filtered
+    taken = 0
+    for f in cfg_hits:
+        if f.getName() in blacklist_names:
+            continue
+        if all(f.getEntryPoint().toString() != d.getEntryPoint().toString() for d in dispatch_funcs):
+            dispatch_funcs.append(f)
+            taken += 1
+        _bump_score(f, 1)
+        if taken >= 3:
+            break
+
+# Consolidate: keep only top-scoring candidates to avoid noisy lists
+if dispatcher_score:
+    max_score = max(dispatcher_score.values())
+    top_candidates = [f for f, s in dispatcher_score.items() if s == max_score]
+    # Preserve original order as much as possible
+    filtered = []
+    for f in dispatch_funcs:
+        if f in top_candidates and f not in filtered:
+            filtered.append(f)
+    dispatch_funcs = filtered or dispatch_funcs
 
 # Report dispatchers we think we found
 if dispatch_funcs:
