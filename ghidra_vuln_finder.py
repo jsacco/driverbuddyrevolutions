@@ -471,6 +471,35 @@ def _find_dispatch_routines():
                         routines.append(tgt)
     return routines
 
+def _find_dispatch_routines_fallback_by_switch():
+    """
+    Fallback: look for functions that appear to be IOCTL switch handlers even if the
+    dispatch table write wasn't recognized. Heuristics:
+      - decompiled text contains user/DeviceIoControl markers
+      - has a 'switch'
+      - contains at least two IOCTL-like constants
+    """
+    fm = currentProgram.getFunctionManager()
+    routines = []
+    seen = set()
+    for f in fm.getFunctions(True):
+        dt = decompiled_text(f)
+        if not dt:
+            continue
+        if 'switch' not in dt:
+            continue
+        if not is_ioctl_context_text(dt):
+            continue
+        codes = _find_ioctls_in_decompiled_text(dt)
+        if len(codes) < 2:
+            continue
+        ep = f.getEntryPoint().toString()
+        if ep in seen:
+            continue
+        seen.add(ep)
+        routines.append(f)
+    return routines
+
 def _find_ioctls_in_decompiled_text(c_code):
     """
     Find IOCTL hex constants in decompiled C text (>= 0x200000 typical 3rd-party range).
@@ -506,13 +535,28 @@ def _find_ioctls_in_decompiled_text(c_code):
 lines.append("[>] Searching for IOCTLs found by analysis...")
 rows = []
 seen = set()
+# Track IOCTL counts per function to guess a dispatcher if table heuristics miss
+ioctl_count_by_func = {}
 
 dispatch_funcs = _find_dispatch_routines()
+# Add switch-based heuristics if dispatch table detection missed them
+for f in _find_dispatch_routines_fallback_by_switch():
+    if all(f.getEntryPoint().toString() != d.getEntryPoint().toString() for d in dispatch_funcs):
+        dispatch_funcs.append(f)
+
+# Report dispatchers we think we found
+if dispatch_funcs:
+    lines.append("  - IOCTL dispatcher candidates:")
+    for df in dispatch_funcs:
+        lines.append("    * {} at {}".format(df.getName(), df.getEntryPoint().toString()))
+else:
+    lines.append("  - No dispatcher candidates found")
 
 for df in dispatch_funcs:
     try:
         c_text = decompiled_text(df)
         codes = _find_ioctls_in_decompiled_text(c_text)
+        ioctl_count_by_func[df] = ioctl_count_by_func.get(df, 0) + len(codes)
         for code in codes:
             addr = find_compare_addresses_for_constant(df, code) or df.getEntryPoint().toString()
             key = (addr, code)
@@ -534,6 +578,7 @@ for f in currentProgram.getListing().getFunctions(True):
         codes = _find_ioctls_in_decompiled_text(c_text)
         if not codes:
             continue
+        ioctl_count_by_func[f] = ioctl_count_by_func.get(f, 0) + len(codes)
         for code in codes:
             addr = find_compare_addresses_for_constant(f, code) or f.getEntryPoint().toString()
             key = (addr, code)
@@ -556,6 +601,12 @@ if rows:
         lines.append(r)
 else:
     lines.append("  - (none detected)")
+
+# Always report the IOCTL-heavy function as a best-guess dispatcher candidate
+if ioctl_count_by_func:
+    best_func, best_count = max(ioctl_count_by_func.items(), key=lambda kv: kv[1])
+    lines.append("  - Heuristic IOCTL-heavy function: {} at {} ({} IOCTL constants)".format(
+        best_func.getName(), best_func.getEntryPoint().toString(), best_count))
 
 # Save decoded IOCTLs log (include the same header)
 ioctl_log_path = File.createTempFile(currentProgram.getName() + "-IOCTLs-", ".txt").getAbsolutePath()
