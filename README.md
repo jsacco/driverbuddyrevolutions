@@ -1,58 +1,117 @@
 # Driver Buddy Revolutions for Ghidra
-By Juan Sacco <support@exploitpack.com> Website: https://exploitpack.com
 
-ghidra_vuln_finder.py is a Ghidra analysis script (based on DriverBuddy) that performs automated static reconnaissance on Windows kernel drivers. It scans the driver for common build patterns and interesting functions, decodes IOCTL values from the .sys file and triage potential attack surfaces (dispatch handlers and userland calls).
+By Juan Sacco <support@exploitpack.com>  
+Website: https://exploitpack.com
 
-### IOCTL discovery & decoding
-Detects IOCTLs both from dispatch-style code (looking for IoControlCode, Parameters.DeviceIoControl, etc. in decompiled functions) and from caller-side uses of IoBuildDeviceIoControlRequest.
-Decodes CTL_CODE fields into their components:
-- Device type (e.g. FILE_DEVICE_NETWORK)
+`ghidra_vuln_finder.py` is a Ghidra analysis script based on DriverBuddy that performs automated static reconnaissance on Windows kernel drivers. It scans drivers for common build patterns, identifies interesting routines, extracts and decodes IOCTLs, maps exposed device interfaces, and helps triage attack surface in dispatch handlers and other user-reachable paths.
+
+## IOCTL Discovery and Decoding
+
+The script detects IOCTLs from multiple sources:
+
+- Dispatch-style handlers by scanning decompiled code for patterns such as `IoControlCode`, `Parameters.DeviceIoControl`, and related IRP field usage
+- Caller-side constructions such as `IoBuildDeviceIoControlRequest`
+- Direct comparisons inside handlers, including compact or uncommon IOCTL values such as `0x10000` and `0x10004` used by drivers like `Beep.sys`
+
+It decodes `CTL_CODE` values into:
+
+- Device type, such as `FILE_DEVICE_NETWORK`
 - Function code
-- Access (FILE_READ/WRITE/ANY)
-- Method (METHOD_BUFFERED/IN_DIRECT/OUT_DIRECT/NEITHER)
+- Access, such as `FILE_ANY_ACCESS`, `FILE_READ_ACCESS`, or `FILE_WRITE_ACCESS`
+- Method, such as `METHOD_BUFFERED`, `METHOD_IN_DIRECT`, `METHOD_OUT_DIRECT`, or `METHOD_NEITHER`
 
-### Device names and symbols
-Extracts literal device and symbolic link names present in decompiled strings (e.g. \Device\Foo, \DosDevices\Bar) to help identify device interfaces and user-visible handles.
+This includes lower-value valid IOCTLs and function code `0`, which are used by some Microsoft drivers and should not be discarded by overly strict heuristics.
 
-### Interesting opcode and API detection
-Reports occurrences of interesting opcodes (e.g. rdmsr, wrmsr, rdpmc) that are suspicious/high-privileged.
-Detects common C functions (e.g. sprintf, memcpy) and many WinAPI kernel functions (I/O, memory, object, and filter APIs) and prints the locations where they appear.
+## Device Names and Symbols
 
-### Vulnerability heuristics added
-The script contains several heuristics intended to highlight potentially dangerous code patterns (useful for triage — not proof of exploitability):
+The script extracts literal device names and symbolic link names present in decompiled strings, including patterns such as:
 
-### Physical memory & low-level IO
-Spots references like \Device\PhysicalMemory, calls to MmMapIoSpace / MmMapLockedPagesSpecifyCache, MmGetPhysicalAddress, and similar routines that indicate direct physical memory or MMIO access.
+- `\Device\Foo`
+- `\DosDevices\Bar`
 
-### Unsafe user-copy patterns
-Flags memcpy/memmove/RtlCopyMemory or C-style copy calls in IOCTL paths that are not preceded by calls to ProbeForRead/ProbeForWrite (or other safety checks), or not wrapped in structured exception handling, suggesting potential user→kernel copy issues.
+This helps identify exposed device interfaces and user-visible handles.
 
-### Integer overflow / allocation heuristics
-Finds ExAllocatePool/ExAllocatePoolWithTag/ExAllocatePoolWithQuota calls where the size argument is derived from user-supplied values without intermediate safe helpers (e.g. RtlULongMult, RtlULongAdd), signalling potential sized-allocation overflows.
+## Interesting Opcode and API Detection
 
-### Privilege gating / access checks
-Highlights sensitive operations performed in IOCTL paths without nearby privilege or access checks (absence of SeSinglePrivilegeCheck, SeAccessCheck, etc.), a heuristic to find privileged operations exposed to user control.
+The script reports a broad set of interesting, privileged, and security-relevant instructions. This includes low-level CPU, MSR, port I/O, register-access, and other hardware-facing instruction patterns that may indicate powerful primitives or unusual kernel behavior. Examples include `rdmsr`, `wrmsr`, and `rdpmc`, but detection is not limited to those.
 
-### I/O port or register access
-Looks for port I/O helpers or patterns that indicate read/write to hardware registers reachable from higher-level code.
+It also identifies common C runtime functions and a wide range of Windows kernel APIs across memory management, object handling, process interaction, I/O, mapping, and filter-related operations, then reports the locations where they appear. This helps surface driver functionality that may be useful during triage, capability mapping, and vulnerability research.
 
-### How it works:
-Decompiler / listing: Uses Ghidra decompiler via DecompInterface to inspect function for dispatch-style artifacts and string literals.
-Instruction scanning: Iterates program instructions to find calls/references (e.g., to IoBuildDeviceIoControlRequest, IoCreateDevice, MmMapIoSpace, etc.).
-Backward constant recovery: When a call-site is found, the script walks backwards a limited window of instructions to locate the immediate scalar that decodes as an IOCTL.
+## Vulnerability Heuristics
 
-CTL_CODE decoding: Implements bit-field extraction consistent with CTL_CODE:
-device = (value >> 16) & 0xFFFF
-access = (value >> 14) & 0x3
-function = (value >> 2) & 0xFFF
-method = value & 0x3
+The script includes several heuristics to highlight potentially dangerous code patterns for triage. These checks are meant to surface functions that deserve manual review and are not proof of exploitability.
+
+### Physical Memory and Low-Level I/O
+
+Flags references and APIs associated with direct physical memory or MMIO access, including:
+
+- `\Device\PhysicalMemory`
+- `MmMapIoSpace`
+- `MmMapLockedPagesSpecifyCache`
+- `MmGetPhysicalAddress`
+
+### Unsafe User-Copy Patterns
+
+Highlights `memcpy`, `memmove`, `RtlCopyMemory`, and similar copy operations in IOCTL paths when they appear without nearby validation such as:
+
+- `ProbeForRead`
+- `ProbeForWrite`
+- Structured exception handling
+
+This can indicate possible user-to-kernel copy issues.
+
+### Integer Overflow and Allocation Heuristics
+
+Finds pool allocations where the size appears to come from user-controlled input without safe arithmetic helpers such as:
+
+- `RtlULongMult`
+- `RtlULongAdd`
+
+This can help identify sized-allocation overflow risks.
+
+### Privilege Gating and Access Checks
+
+Highlights sensitive operations reachable from IOCTL handlers when nearby privilege or access checks are missing, such as:
+
+- `SeSinglePrivilegeCheck`
+- `SeAccessCheck`
+
+This is useful for spotting privileged behavior exposed to user control.
+
+### I/O Port and Register Access
+
+Looks for helpers and patterns that suggest read or write access to hardware ports, CPU registers, MSRs, or device registers from reachable driver code paths.
+
+## How It Works
+
+### Decompiler and Listing Analysis
+
+Uses Ghidra's decompiler through `DecompInterface` to inspect functions for dispatch-related artifacts, string literals, and user-controlled code paths.
+
+### Instruction Scanning
+
+Walks program instructions to locate calls and references to important routines such as `IoBuildDeviceIoControlRequest`, `IoCreateDevice`, `MmMapIoSpace`, and many other sensitive APIs.
+
+### Backward Constant Recovery
+
+When a relevant call site is found, the script walks backward through a limited instruction window to recover immediate constants that decode as IOCTLs.
+
+### CTL_CODE Decoding
+
+Implements standard `CTL_CODE` bit extraction:
+```
+device   = (value >> 16) & 0xFFFF
+access   = (value >> 14) & 0x3
+function = (value >> 2)  & 0xFFF
+method   = value & 0x3
+```
 
 ### Heuristics: 
 Uses presence/absence of known API calls and string/constant analysis to flag suspicious functions.
 
 ### How to use:
 1. Copy ghidra_vuln_finder.py to your Ghidra Script Manager/dbg-scripts folder.
-2. Open the driver binary in Ghidra (set correct language/processor if necessary).
+2. Open the target driver in Ghidra (set correct language/processor if necessary).
 3. Run the script from Script Manager or press Shift + A
 4. View the printed output in Ghidra’s console, also a log with this output is created in your temp folder.
 
