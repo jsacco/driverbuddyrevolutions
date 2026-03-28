@@ -92,7 +92,8 @@ def plausible_ioctl(v):
     d = ctl_code_decode(v)
     if not d: return False
     if d['method'] not in (0,1,2,3): return False
-    if d['function'] == 0 or d['device'] == 0:
+    # Function 0 is valid for some Microsoft drivers, e.g. BEEP_SET_PARAMETERS (0x10000).
+    if d['device'] == 0:
         return False
     return True
 
@@ -567,7 +568,7 @@ def _find_dispatch_by_cfg():
 
 def _find_ioctls_in_decompiled_text(c_code):
     """
-    Find IOCTL hex constants in decompiled C text (>= 0x200000 typical 3rd-party range).
+    Find IOCTL hex constants in decompiled C text.
     """
     ioctls = set()
     if not c_code:
@@ -576,6 +577,7 @@ def _find_ioctls_in_decompiled_text(c_code):
 
     patterns = [
         r'case\s+0x([0-9A-Fa-f]+)\s*:',
+        r'(?:if|else if)\s*\([^{};]*?==\s*0x([0-9A-Fa-f]+)',
         r'ioControlCode\s*==\s*0x([0-9A-Fa-f]+)',
         r'(?:if|else if)\s*\(\s*(?:\([^)]*\))?\s*(?:iVar\d+|uVar\d+|\w+)\s*==\s*0x([0-9A-Fa-f]+)',
         r'(?:\(\s*)+(?:iVar\d+|uVar\d+|\w+)\s*==\s*0x([0-9A-Fa-f]+)(?:\s*\))+',
@@ -590,7 +592,7 @@ def _find_ioctls_in_decompiled_text(c_code):
         try:
             for m in re.finditer(pat, normalized, re.IGNORECASE | re.MULTILINE | re.DOTALL):
                 val = int(m.group(1), 16)
-                if val >= 0x200000 and plausible_ioctl(val):
+                if plausible_ioctl(val):
                     ioctls.add(val & 0xFFFFFFFF)
         except Exception:
             pass
@@ -603,6 +605,8 @@ seen = set()
 # Track IOCTL counts per function to guess a dispatcher if table heuristics miss
 ioctl_count_by_func = {}
 dispatcher_score = {}
+ioctl_to_source_funcs = {}  # ioctl_code (int) -> set(function entrypoint string)
+_func_by_ep = {}            # entrypoint string -> Function
 
 def _bump_score(func, pts):
     if func is None:
@@ -667,7 +671,12 @@ for df in dispatch_funcs:
         c_text = decompiled_text(df)
         codes = _find_ioctls_in_decompiled_text(c_text)
         ioctl_count_by_func[df] = ioctl_count_by_func.get(df, 0) + len(codes)
+        _func_by_ep[df.getEntryPoint().toString()] = df
         for code in codes:
+            ep = df.getEntryPoint().toString()
+            if code not in ioctl_to_source_funcs:
+                ioctl_to_source_funcs[code] = set()
+            ioctl_to_source_funcs[code].add(ep)
             addr = find_compare_addresses_for_constant(df, code) or df.getEntryPoint().toString()
             key = (addr, code)
             if key in seen:
@@ -689,7 +698,12 @@ for f in currentProgram.getListing().getFunctions(True):
         if not codes:
             continue
         ioctl_count_by_func[f] = ioctl_count_by_func.get(f, 0) + len(codes)
+        _func_by_ep[f.getEntryPoint().toString()] = f
         for code in codes:
+            ep = f.getEntryPoint().toString()
+            if code not in ioctl_to_source_funcs:
+                ioctl_to_source_funcs[code] = set()
+            ioctl_to_source_funcs[code].add(ep)
             addr = find_compare_addresses_for_constant(f, code) or f.getEntryPoint().toString()
             key = (addr, code)
             if key in seen:
@@ -717,6 +731,121 @@ if ioctl_count_by_func:
     best_func, best_count = max(ioctl_count_by_func.items(), key=lambda kv: kv[1])
     lines.append("  - Heuristic IOCTL-heavy function: {} at {} ({} IOCTL constants)".format(
         best_func.getName(), best_func.getEntryPoint().toString(), best_count))
+
+# ----------------------------- IOCTL <-> Vulnerable Functions mapping -----------------------------
+# Build a lightweight static reachability map from IOCTL-bearing functions to risky APIs/functions.
+lines.append("")
+lines.append("[>] IOCTL <-> Vulnerable Functions:")
+
+_RISKY_APIS = set([
+    # Scavenger-aligned sensitive routines
+    'MmMapIoSpace', 'MmMapIoSpaceEx', 'MmUnmapIoSpace',
+    'ZwMapViewOfSection', 'ZwUnmapViewOfSection', 'NtMapViewOfSection', 'NtUnmapViewOfSection',
+    'ZwOpenProcess', 'ZwTerminateProcess', 'ObOpenObjectByPointer', 'ObCloseHandle',
+    'memcpy', 'memmove', 'RtlCopyMemory', 'MmCopyMemory', 'ZwOpenSection'
+])
+
+def _collect_direct_api_refs(func):
+    out = set()
+    try:
+        listing = currentProgram.getListing()
+        for instr in listing.getInstructions(func.getBody(), True):
+            if not instr.getFlowType().isCall():
+                continue
+            for r in instr.getReferencesFrom():
+                nm = get_symbol_name(r.getToAddress())
+                if nm and nm in _RISKY_APIS:
+                    out.add(nm)
+    except Exception:
+        pass
+    return out
+
+def _build_call_graph():
+    # Graph keyed by function entrypoint string for stable set/dict behavior in Jython.
+    graph = {}
+    listing = currentProgram.getListing()
+    for f in currentProgram.getListing().getFunctions(True):
+        ep = f.getEntryPoint().toString()
+        _func_by_ep[ep] = f
+        graph[ep] = set()
+        try:
+            for instr in listing.getInstructions(f.getBody(), True):
+                if not instr.getFlowType().isCall():
+                    continue
+                for r in instr.getReferencesFrom():
+                    callee = getFunctionAt(r.getToAddress())
+                    if callee:
+                        graph[ep].add(callee.getEntryPoint().toString())
+        except Exception:
+            pass
+    return graph
+
+def _reachable_risky_funcs(start_ep, graph, direct_api_by_ep, max_depth=4, max_nodes=400):
+    # Returns list of tuples: (function_ep, depth, [apis...])
+    out = {}
+    q = [(start_ep, 0)]
+    visited = set()
+    while q and len(visited) < max_nodes:
+        cur, depth = q.pop(0)
+        if cur in visited:
+            continue
+        visited.add(cur)
+
+        apis = direct_api_by_ep.get(cur, set())
+        if apis:
+            if cur not in out or depth < out[cur][0]:
+                out[cur] = (depth, sorted(apis))
+
+        if depth >= max_depth:
+            continue
+        for nxt in graph.get(cur, set()):
+            if nxt not in visited:
+                q.append((nxt, depth + 1))
+    # Stable order: direct first, then by function address string
+    items = []
+    for ep, (d, apis) in out.items():
+        items.append((ep, d, apis))
+    items.sort(key=lambda x: (x[1], x[0]))
+    return items
+
+if ioctl_to_source_funcs:
+    _call_graph = _build_call_graph()
+    _direct_api_by_ep = {}
+    for ep, f in _func_by_ep.items():
+        refs = _collect_direct_api_refs(f)
+        if refs:
+            _direct_api_by_ep[ep] = refs
+
+    any_link = False
+    for code in sorted(ioctl_to_source_funcs.keys()):
+        src_eps = sorted(ioctl_to_source_funcs.get(code, set()))
+        # Aggregate by vulnerable function entrypoint; keep minimum depth and merged APIs.
+        agg = {}
+        for sep in src_eps:
+            for f_ep, depth, apis in _reachable_risky_funcs(sep, _call_graph, _direct_api_by_ep):
+                if f_ep not in agg:
+                    agg[f_ep] = {'depth': depth, 'apis': set(apis), 'via': set([sep])}
+                else:
+                    agg[f_ep]['depth'] = min(agg[f_ep]['depth'], depth)
+                    agg[f_ep]['apis'].update(apis)
+                    agg[f_ep]['via'].add(sep)
+
+        if not agg:
+            continue
+
+        any_link = True
+        lines.append("  - IOCTL 0x{0:08X}".format(code & 0xFFFFFFFF))
+        for f_ep, info in sorted(agg.items(), key=lambda kv: (kv[1]['depth'], kv[0])):
+            fobj = _func_by_ep.get(f_ep)
+            fname = fobj.getName() if fobj else f_ep
+            apis = ", ".join(sorted(info['apis']))
+            depth_txt = "direct" if info['depth'] == 0 else ("indirect+{}".format(info['depth']))
+            lines.append("    * {0} at {1} [{2}] :: {3}".format(fname, f_ep, depth_txt, apis))
+
+    if not any_link:
+        lines.append("  - (no static links to configured risky APIs were found)")
+else:
+    lines.append("  - (no IOCTLs decoded, cannot build IOCTL-to-vuln mapping)")
 
 # Save decoded IOCTLs log (include the same header)
 ioctl_log_path = File.createTempFile(currentProgram.getName() + "-IOCTLs-", ".txt").getAbsolutePath()
