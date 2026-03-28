@@ -56,7 +56,8 @@ Uses presence/absence of known API calls and string/constant analysis to flag su
 3. Run the script from Script Manager or press Shift + A
 4. View the printed output in Ghidra’s console, also a log with this output is created in your temp folder.
 
-<img src="https://iili.io/KNtpwc7.png">
+
+<img width="2411" height="1138" alt="Screenshot From 2026-03-28 16-42-14" src="https://github.com/user-attachments/assets/43cbc38d-dc9d-41bb-8a58-9aeb2e87aca8" />
 
 
 ### Credits:
