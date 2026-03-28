@@ -33,9 +33,9 @@ This helps identify exposed device interfaces and user-visible handles.
 
 ## Interesting Opcode and API Detection
 
-The script reports a broad set of interesting, privileged, and security-relevant instructions. This includes low-level CPU, MSR, port I/O, register-access, and other hardware-facing instruction patterns that may indicate powerful primitives or unusual kernel behavior. Examples include `rdmsr`, `wrmsr`, and `rdpmc`, but detection is not limited to those.
+The script reports a broad set of interesting, privileged, and security-relevant instructions. This includes low-level CPU, MSR, port I/O, register-access, and other hardware-facing instruction patterns that may indicate powerful primitives or unusual kernel behavior.
 
-It also identifies common C runtime functions and a wide range of Windows kernel APIs across memory management, object handling, process interaction, I/O, mapping, and filter-related operations, then reports the locations where they appear. This helps surface driver functionality that may be useful during triage, capability mapping, and vulnerability research.
+It also identifies common C runtime functions and a wide range of Windows kernel APIs across memory management, object handling, process interaction, I/O, mapping, and filter-related operations, then reports the locations where they appear. This helps surface driver functionality that may be useful during vulnerability research.
 
 ## Vulnerability Heuristics
 
