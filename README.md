@@ -3,7 +3,7 @@
 By Juan Sacco <support@exploitpack.com>  
 Website: https://exploitpack.com
 
-`ghidra_vuln_finder.py` is a Ghidra analysis script based on DriverBuddy that performs automated static reconnaissance on Windows kernel drivers. It scans drivers for common build patterns, identifies interesting routines, extracts and decodes IOCTLs, maps exposed device interfaces, and helps triage attack surface in dispatch handlers and other user-reachable paths.
+Driver Buddy Revolutions is a Ghidra analysis script based on DriverBuddy that performs automated static reconnaissance on Windows kernel drivers. It scans drivers for common build patterns, identifies interesting routines, extracts and decodes IOCTLs, maps exposed device interfaces, and helps triage attack surface in dispatch handlers and other user-reachable paths.
 
 ## IOCTL Discovery and Decoding
 
